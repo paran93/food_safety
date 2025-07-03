@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+scipy # Faiss depends on scipy for some operations
+faiss-cpu # Use faiss-cpu for broader compatibility on Streamlit Community Cloud
+sentence-transformers
+plotly
+matplotlib
+seaborn
