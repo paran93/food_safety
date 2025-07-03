@@ -7,10 +7,10 @@ import hashlib
 import faiss
 from sentence_transformers import SentenceTransformer
 import warnings
-import matplotlib.pyplot as plt
-import seaborn as sns
+import matplotlib.pyplot as plt # Kept for completeness, though Plotly is primary
+import seaborn as sns # Kept for completeness
 import plotly.express as px
-import requests
+import requests # Kept for general web requests if needed, not for CSV load
 import io
 from typing import List, Dict, Tuple, Any
 
@@ -33,7 +33,9 @@ class NYCFoodSafetyRAG:
         self.processed_restaurants = []
 
     def get_cache_key(self, identifier, sample_size=None):
+        """Generate unique cache key based on identifier (file path or URL) and parameters"""
         content = f"{identifier}_{sample_size}"
+        # If identifier is a file path, also include file modification time and size
         if os.path.exists(identifier) and not identifier.startswith(('http://', 'https://')):
             try:
                 file_stat = os.stat(identifier)
@@ -43,7 +45,11 @@ class NYCFoodSafetyRAG:
         return hashlib.md5(content.encode()).hexdigest().encode('utf-8')
 
     @st.cache_data(show_spinner="⏳ Loading and preprocessing data...")
-    def load_data(_self, data_source_identifier, sample_size=None):
+    def load_data(_self, data_source_identifier, sample_size=None): # Changed 'self' to '_self'
+        """
+        Load and preprocess data with caching.
+        data_source_identifier is expected to be a local file path for this app.
+        """
         st.info("Loading NYC Food Safety dataset...")
 
         cache_key = _self.get_cache_key(data_source_identifier, sample_size)
@@ -60,7 +66,7 @@ class NYCFoodSafetyRAG:
                 st.warning(f"⚠️ Data cache corrupted, reloading: {e}")
                 os.remove(cache_file)
 
-        # Assuming data_source_identifier is a local file path (for GitHub hosting)
+        # Expecting a local file path from GitHub
         if data_source_identifier.startswith(('http://', 'https://')):
             st.error("This app is configured to load CSV from a local GitHub path. "
                      "Please ensure 'NY_food_safety.csv' is in your GitHub repo root.")
@@ -282,7 +288,7 @@ class NYCFoodSafetyRAG:
 
     def _create_embeddings_optimized(self):
         st.info("Creating embeddings...")
-        # Note: Model loading moved to _rebuild_assets_from_scratch to ensure it's loaded before encode
+        # Note: Model loading happens in _rebuild_assets_from_scratch
         
         violation_texts = [doc['text'] for doc in self.processed_violations]
         progress_violation = st.progress(0, text="Creating violation embeddings...")
@@ -377,7 +383,7 @@ class FoodSafetyAssistant:
         if query_type == 'analysis':
             return self._handle_analysis_query(question)
         elif query_type == 'search':
-            return self._handle_search_query(question), None
+            return self._handle_search_query(question) # This now returns (text, map_object)
         elif query_type == 'recommendation':
             return self._handle_recommendation_query(question), None
         else:
@@ -464,96 +470,153 @@ class FoodSafetyAssistant:
 
         return response_text, plot_object
 
-    def _handle_search_query(self, question: str) -> Tuple[str, None]:
-        """Handle search-type queries"""
-        results = self.rag.search(question, top_k=5)
+    def _handle_search_query(self, question: str) -> Tuple[str, Any]: # Modified return type to include Any for plot
+        """Handle search-type queries with improved output for restaurants and a map."""
+        results = self.rag.search(question, top_k=10) # Get more results to ensure we capture all relevant records for a restaurant
 
         if not results:
-            return "❌ No relevant results found for your query. Try rephrasing or be more specific.", None
+            return "❌ No relevant restaurants or violations found for your query. Try rephrasing or be more specific.", None
 
-        response_parts = [f"🔍 **Search Results for '{question}':**"]
-
-        for i, result in enumerate(results, 1):
-            if result['type'] == 'violation':
-                response_parts.append(f"**{i}. {result['restaurant_name']}** ({result['borough']})")
-                response_parts.append(f"   • Cuisine: {result['cuisine']}")
-                response_parts.append(f"   • Violation: {result['violation_description'][:100]}...")
-                response_parts.append(f"   • Critical: {result['critical_flag']} | Score: {result['score']} | Grade: {result['grade']}")
-                response_parts.append(f"   • Date: {result['inspection_date']}")
-            else: # result['type'] == 'restaurant'
-                response_parts.append(f"**{i}. {result['name']}** ({result['borough']})")
-                response_parts.append(f"   • Cuisine: {result['cuisine']}")
-                response_parts.append(f"   • Total Violations: {result['total_violations']} | Critical: {result['critical_violations']}")
-                response_parts.append(f"   • Avg Score: {result['avg_score']:.1f} | Recent Grade: {result['recent_grade']}")
-        return "\n\n".join(response_parts), None
-
-    def _handle_recommendation_query(self, question: str) -> Tuple[str, None]:
-        """Handle recommendation-type queries"""
         response_parts = []
-        if 'avoid' in question.lower() or 'worst' in question.lower():
-            # Find restaurants with worst scores
-            worst_restaurants = self.rag.df.groupby(['CAMIS', 'DBA']).agg(
-                SCORE=('SCORE', 'mean'),
-                IS_CRITICAL=('IS_CRITICAL', 'sum'),
-                BORO=('BORO', 'first'),
-                CUISINE_DESCRIPTION=('CUISINE DESCRIPTION', 'first')
-            ).sort_values('SCORE', ascending=False).head(10)
+        map_data = [] # To store data for the map
+        
+        # --- Group results by restaurant CAMIS ---
+        # Collect unique CAMIS from search results, and then pull full data from main DataFrame
+        relevant_camis = set()
+        for res in results:
+            if res['type'] == 'restaurant':
+                relevant_camis.add(res['camis'])
+            elif res['type'] == 'violation':
+                # Find CAMIS in the original DataFrame based on restaurant name (DBA)
+                matching_rows = self.rag.df[self.rag.df['DBA'].str.contains(res['restaurant_name'], case=False, na=False)]
+                if not matching_rows.empty:
+                    relevant_camis.update(matching_rows['CAMIS'].unique())
 
-            response_parts.append(f"👎 **Restaurants with the Highest Average Inspection Scores (Potentially Worse):**")
-            for i, (_, restaurant) in enumerate(worst_restaurants.iterrows(), 1):
-                response_parts.append(f"{i}. **{restaurant.name[1]}** ({restaurant['BORO']})")
-                response_parts.append(f"   • Cuisine: {restaurant['CUISINE_DESCRIPTION']}")
-                response_parts.append(f"   • Avg Score: {restaurant['SCORE']:.1f}")
-                response_parts.append(f"   • Total Critical Violations: {int(restaurant['IS_CRITICAL'])}")
-            return "\n\n".join(response_parts), None
+        # Now, gather all latest info for these CAMIS from the main dataframe
+        # Sort by inspection date to get the most recent valid location data and grade
+        unique_restaurants_summary = self.rag.df[self.rag.df['CAMIS'].isin(relevant_camis)] \
+                                                    .sort_values(by='INSPECTION DATE', ascending=False) \
+                                                    .groupby('CAMIS') \
+                                                    .first() \
+                                                    .reset_index()
 
-        elif 'best' in question.lower() or 'recommend' in question.lower() or 'safest' in question.lower():
-            # Find restaurants with best scores (Grade 'A' and lowest average scores)
-            best_restaurants = self.rag.df[self.rag.df['GRADE'] == 'A'].groupby(['CAMIS', 'DBA']).agg(
-                SCORE=('SCORE', 'mean'),
-                IS_CRITICAL=('IS_CRITICAL', 'sum'),
-                BORO=('BORO', 'first'),
-                CUISINE_DESCRIPTION=('CUISINE DESCRIPTION', 'first')
-            ).sort_values('SCORE', ascending=True).head(10)
+        # Build data for the map and the detailed text response
+        restaurants_found_for_text = {} # Dictionary to build the structured text response
 
-            response_parts.append(f"👍 **Recommended Restaurants (Grade 'A', Lowest Average Scores):**")
-            if best_restaurants.empty:
-                response_parts.append("No restaurants with 'A' grade found in the current dataset slice with low scores.")
+        for _, row in unique_restaurants_summary.iterrows():
+            camis = row['CAMIS']
+            
+            # Filter all violations for this specific CAMIS from the original DataFrame
+            restaurant_violations_df = self.rag.df[(self.rag.df['CAMIS'] == camis)].copy()
+            
+            # Prepare data for map
+            # Ensure LATITUDE and LONGITUDE are available and not NaN
+            if pd.notna(row.get('LATITUDE')) and pd.notna(row.get('LONGITUDE')):
+                map_data.append({
+                    'name': row.get('DBA', 'N/A'),
+                    'latitude': row.get('LATITUDE'),
+                    'longitude': row.get('LONGITUDE'),
+                    'grade': row.get('GRADE', 'N/A'),
+                    'score': row.get('SCORE', 0),
+                    'critical_violations': len(restaurant_violations_df[restaurant_violations_df['CRITICAL FLAG'] == 'Critical']),
+                    'cuisine': row.get('CUISINE DESCRIPTION', 'N/A'),
+                    'borough': row.get('BORO', 'N/A')
+                })
+            
+            # Prepare data for text response (similar to previous improved logic)
+            data = {
+                'name': row.get('DBA', 'N/A'),
+                'borough': row.get('BORO', 'N/A'),
+                'cuisine': row.get('CUISINE DESCRIPTION', 'N/A'),
+                'total_violations': len(restaurant_violations_df), # Total inspections for this CAMIS
+                'critical_violations': len(restaurant_violations_df[restaurant_violations_df['CRITICAL FLAG'] == 'Critical']),
+                'avg_score': restaurant_violations_df['SCORE'].mean(),
+                'recent_grade': row.get('GRADE', 'N/A'), # Use the most recent grade from groupby().first()
+                'violations_detail': []
+            }
+            
+            # Populate violations_detail for text response (top 5 most recent violations)
+            for _, violation_row in restaurant_violations_df.sort_values(by='INSPECTION DATE', ascending=False).head(5).iterrows():
+                data['violations_detail'].append({
+                    'description': violation_row.get('VIOLATION DESCRIPTION', 'N/A'),
+                    'critical': violation_row.get('CRITICAL FLAG', 'N/A'),
+                    'score': violation_row.get('SCORE', 0),
+                    'date': str(violation_row.get('INSPECTION DATE', pd.NaT).date()) if pd.notna(violation_row.get('INSPECTION DATE')) else 'N/A'
+                })
+            
+            restaurants_found_for_text[camis] = data # Store for text processing
+
+
+        if not restaurants_found_for_text:
+             return "🔍 No specific restaurants found matching your search. Results might be too general or not highly relevant.", None
+
+        response_parts.append(f"🔍 **Relevant Restaurant Safety Records:**\n")
+
+        # Sort restaurants for display (e.g., by name)
+        sorted_restaurants_for_display = sorted(restaurants_found_for_text.values(), key=lambda x: x['name'])
+
+        for data in sorted_restaurants_for_display:
+            response_parts.append(f"--- **{data['name']}** ({data['borough']}, Cuisine: {data['cuisine']}) ---")
+            response_parts.append(f"• **Overall Record:** Recent Grade: `{data['recent_grade']}` | Avg Score: `{data['avg_score']:.1f}` | Total Inspections/Violations in records: `{data['total_violations']}`")
+
+            if data['critical_violations'] > 0:
+                response_parts.append(f"• **Critical Violations:** **`{data['critical_violations']}` critical violations found** in records.")
+                critical_violations_list = [v for v in data['violations_detail'] if v['critical'] == 'Critical']
+                if critical_violations_list:
+                    response_parts.append(f"  **Recent Critical Details (Top {min(3, len(critical_violations_list))}):**")
+                    for i, violation in enumerate(critical_violations_list[:3]):
+                        response_parts.append(f"  - `{violation['date']}`: {violation['description'][:100]}... (Score: {violation['score']})")
+                
+            elif data['total_violations'] > 0:
+                response_parts.append(f"• **No critical violations** found in records.")
+                if data['violations_detail']:
+                     response_parts.append(f"  **Recent Inspection Details (Top {min(3, len(data['violations_detail']))}):**")
+                     for i, violation in enumerate(data['violations_detail'][:3]):
+                        response_parts.append(f"  - `{violation['date']}`: {violation['description'][:100]}... (Critical: {violation['critical']}, Score: {violation['score']})")
             else:
-                for i, (_, restaurant) in enumerate(best_restaurants.iterrows(), 1):
-                    response_parts.append(f"{i}. **{restaurant.name[1]}** ({restaurant['BORO']})")
-                    response_parts.append(f"   • Cuisine: {restaurant['CUISINE_DESCRIPTION']}")
-                    response_parts.append(f"   • Avg Score: {restaurant['SCORE']:.1f}")
-                    response_parts.append(f"   • Total Critical Violations: {int(restaurant['IS_CRITICAL'])}")
-            return "\n\n".join(response_parts), None
-        else:
-            return "I can recommend safe restaurants or list those to avoid. Please specify.", None
+                response_parts.append(f"• **No violations found** in records for this restaurant.")
+            
+            response_parts.append("\n") # Add a blank line for separation
 
-    def _handle_general_query(self, question: str) -> Tuple[str, None]:
-        """Handle general queries with RAG search"""
-        results = self.rag.search(question, top_k=3)
+        # --- Create the map visualization ---
+        map_object = None
+        if map_data:
+            map_df = pd.DataFrame(map_data)
+            # Ensure latitude and longitude are numeric and drop NaNs
+            map_df['latitude'] = pd.to_numeric(map_df['latitude'], errors='coerce')
+            map_df['longitude'] = pd.to_numeric(map_df['longitude'], errors='coerce')
+            map_df.dropna(subset=['latitude', 'longitude'], inplace=True) # Drop rows with missing coords
 
-        if not results:
-            return "🤔 I couldn't find specific information about your query. Try asking about specific restaurants, violations, or requesting an analysis.", None
+            if not map_df.empty:
+                # Use Plotly Express scatter_mapbox for interactive map
+                map_object = px.scatter_mapbox(
+                    map_df,
+                    lat="latitude",
+                    lon="longitude",
+                    hover_name="name",
+                    hover_data={
+                        "grade": True,
+                        "score": True,
+                        "critical_violations": True,
+                        "cuisine": True,
+                        "borough": True,
+                        "latitude": False, # Don't show lat/lon in hover
+                        "longitude": False
+                    },
+                    color="grade", # Color points by grade
+                    color_discrete_map={ # Define specific colors for grades
+                        "A": "green", "B": "orange", "C": "red",
+                        "Not Graded": "gray", "P": "purple", "Z": "blue", # P: Pending, Z: Grade Pending
+                        "N": "lightgray" # N: Not Yet Graded
+                    },
+                    zoom=9, # Adjust initial zoom level
+                    height=500,
+                    title="Restaurant Locations"
+                )
+                map_object.update_layout(mapbox_style="open-street-map") # Use OpenStreetMap tiles
+                map_object.update_layout(margin={"r":0,"t":40,"l":0,"b":0}) # Adjust margins
 
-        response_parts = [f"💡 **Based on the food safety data for '{question}':**"]
-
-        violation_results = [r for r in results if r['type'] == 'violation']
-        restaurant_results = [r for r in results if r['type'] == 'restaurant']
-
-        if violation_results:
-            response_parts.append(f"\n**Relevant Violations Found ({len(violation_results)}):**")
-            for result in violation_results[:2]: # Show top 2 for brevity in general query
-                response_parts.append(f"• **{result['restaurant_name']}**: {result['violation_description'][:80]}...")
-                response_parts.append(f"  *(Critical: {result['critical_flag']}, Score: {result['score']})*")
-
-        if restaurant_results:
-            response_parts.append(f"\n**Relevant Restaurants Found ({len(restaurant_results)}):**")
-            for result in restaurant_results[:2]: # Show top 2 for brevity in general query
-                response_parts.append(f"• **{result['name']}**: {result['total_violations']} violations, {result['critical_violations']} critical")
-                response_parts.append(f"  *(Avg Score: {result['avg_score']:.1f}, Recent Grade: {result['recent_grade']})*")
-
-        return "\n\n".join(response_parts), None
+        return "\n".join(response_parts), map_object
 
 
 # =============================================================================
@@ -561,7 +624,6 @@ class FoodSafetyAssistant:
 # =============================================================================
 
 # --- Configuration for Data Source ---
-# With your 20MB file, hosting directly on GitHub is now the best approach.
 # Ensure 'NY_food_safety.csv' is in the SAME DIRECTORY as your app.py in GitHub.
 DATA_SOURCE_PATH = 'NY_food_safety.csv'
 
@@ -574,7 +636,7 @@ DATA_SOURCE_PATH = 'NY_food_safety.csv'
 # faiss-cpu
 # sentence-transformers
 # plotly
-# requests # Keep requests just in case, though not directly used for local CSV
+# requests
 # matplotlib
 # seaborn
 
@@ -608,7 +670,6 @@ def main_streamlit_app():
 
     # Display sample restaurants and queries in sidebar
     st.sidebar.header("Sample Restaurants & Queries")
-    # Ensure 'DBA' column exists before trying to access it
     if 'DBA' in rag_system.df.columns and not rag_system.df['DBA'].empty:
         sample_restaurants = rag_system.df['DBA'].drop_duplicates().head(5).tolist()
         st.sidebar.write("Try asking about:")
@@ -630,7 +691,7 @@ def main_streamlit_app():
 
 
     # User input
-    user_query = st.text_input("Your Question:", "Analyze critical violations", help="Type your question here and press Enter or click 'Ask Assistant'")
+    user_query = st.text_input("Your Question:", "Does MCDONALD'S have any critical violations?", help="Type your question here and press Enter or click 'Ask Assistant'")
 
     # Initialize session state for last_query if it doesn't exist
     if 'last_query' not in st.session_state:
