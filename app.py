@@ -618,6 +618,74 @@ class FoodSafetyAssistant:
 
         return "\n".join(response_parts), map_object
 
+    def _handle_recommendation_query(self, question: str) -> Tuple[str, None]:
+        """Handle recommendation-type queries"""
+        response_parts = []
+        if 'avoid' in question.lower() or 'worst' in question.lower():
+            # Find restaurants with worst scores
+            worst_restaurants = self.rag.df.groupby(['CAMIS', 'DBA']).agg(
+                SCORE=('SCORE', 'mean'),
+                IS_CRITICAL=('IS_CRITICAL', 'sum'),
+                BORO=('BORO', 'first'),
+                CUISINE_DESCRIPTION=('CUISINE DESCRIPTION', 'first')
+            ).sort_values('SCORE', ascending=False).head(10)
+
+            response_parts.append(f"👎 **Restaurants with the Highest Average Inspection Scores (Potentially Worse):**")
+            for i, (_, restaurant) in enumerate(worst_restaurants.iterrows(), 1):
+                response_parts.append(f"{i}. **{restaurant.name[1]}** ({restaurant['BORO']})")
+                response_parts.append(f"   • Cuisine: {restaurant['CUISINE_DESCRIPTION']}")
+                response_parts.append(f"   • Avg Score: {restaurant['SCORE']:.1f}")
+                response_parts.append(f"   • Total Critical Violations: {int(restaurant['IS_CRITICAL'])}")
+            return "\n\n".join(response_parts), None
+
+        elif 'best' in question.lower() or 'recommend' in question.lower() or 'safest' in question.lower():
+            # Find restaurants with best scores (Grade 'A' and lowest average scores)
+            best_restaurants = self.rag.df[self.rag.df['GRADE'] == 'A'].groupby(['CAMIS', 'DBA']).agg(
+                SCORE=('SCORE', 'mean'),
+                IS_CRITICAL=('IS_CRITICAL', 'sum'),
+                BORO=('BORO', 'first'),
+                CUISINE_DESCRIPTION=('CUISINE DESCRIPTION', 'first')
+            ).sort_values('SCORE', ascending=True).head(10)
+
+            response_parts.append(f"👍 **Recommended Restaurants (Grade 'A', Lowest Average Scores):**")
+            if best_restaurants.empty:
+                response_parts.append("No restaurants with 'A' grade found in the current dataset slice with low scores.")
+            else:
+                for i, (_, restaurant) in enumerate(best_restaurants.iterrows(), 1):
+                    response_parts.append(f"{i}. **{restaurant.name[1]}** ({restaurant['BORO']})")
+                    response_parts.append(f"   • Cuisine: {restaurant['CUISINE_DESCRIPTION']}")
+                    response_parts.append(f"   • Avg Score: {restaurant['SCORE']:.1f}")
+                    response_parts.append(f"   • Total Critical Violations: {int(restaurant['IS_CRITICAL'])}")
+            return "\n\n".join(response_parts), None
+        else:
+            return "I can recommend safe restaurants or list those to avoid. Please specify.", None
+
+    def _handle_general_query(self, question: str) -> Tuple[str, None]:
+        """Handle general queries with RAG search"""
+        results = self.rag.search(question, top_k=3)
+
+        if not results:
+            return "🤔 I couldn't find specific information about your query. Try asking about specific restaurants, violations, or requesting an analysis.", None
+
+        response_parts = [f"💡 **Based on the food safety data for '{question}':**"]
+
+        violation_results = [r for r in results if r['type'] == 'violation']
+        restaurant_results = [r for r in results if r['type'] == 'restaurant']
+
+        if violation_results:
+            response_parts.append(f"\n**Relevant Violations Found ({len(violation_results)}):**")
+            for result in violation_results[:2]: # Show top 2 for brevity in general query
+                response_parts.append(f"• **{result['restaurant_name']}**: {result['violation_description'][:80]}...")
+                response_parts.append(f"  *(Critical: {result['critical_flag']}, Score: {result['score']})*")
+
+        if restaurant_results:
+            response_parts.append(f"\n**Relevant Restaurants Found ({len(restaurant_results)}):**")
+            for result in restaurant_results[:2]: # Show top 2 for brevity in general query
+                response_parts.append(f"• **{result['name']}**: {result['total_violations']} violations, {result['critical_violations']} critical")
+                response_parts.append(f"  *(Avg Score: {result['avg_score']:.1f}, Recent Grade: {result['recent_grade']})*")
+
+        return "\n\n".join(response_parts), None
+
 
 # =============================================================================
 # STREAMLIT APP LAYOUT AND LOGIC
